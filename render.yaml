@@ -1,0 +1,36 @@
+# Render Blueprint: New → Blueprint → pick this repo. Render prompts for every sync:false value.
+services:
+  - type: web
+    name: skms-backend
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ADMIN_SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_URL          # Neon connection string (-pooler host, ?sslmode=require)
+        sync: false
+      - key: CLIENT_URL            # skms-frontend on Vercel, e.g. https://skms-frontend.vercel.app
+        sync: false
+      - key: ADMIN_URL             # skms-academy-admin on Vercel
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
