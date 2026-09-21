@@ -27,7 +27,7 @@ Razorpay webhook URL: `https://<service>.onrender.com/api/checkout/razorpay/webh
 | Content | `GET /api/cms`, `GET /api/cms/:section`, `PUT`/`POST`/`DELETE /api/cms/:section` (admin) |
 | Reviews | `GET /api/reviews`, `POST /api/reviews` (visitor submission); admin: `GET/PUT/POST /api/admin/reviews`, `DELETE /api/admin/reviews/:index`, `GET /api/admin/review-inbox`, `POST /api/admin/review-inbox/:id/approve`, `DELETE /api/admin/review-inbox/:id` |
 | Plans | `GET /api/plans/live`, `PUT /api/admin/plans/bulk-sync` (admin, one transaction, `?dryRun=1`) |
-| Checkout | `POST /api/checkout/razorpay` (student), `POST /api/checkout/razorpay/verify`, `POST /api/checkout/razorpay/webhook`; `GET /api/enrollments` (admin) |
+| Checkout | `POST /api/checkout/razorpay` (student), `POST /api/checkout/razorpay/verify`, `POST /api/checkout/razorpay/webhook`; `GET /api/account` (student profile and successful plans); `GET /api/enrollments` (admin) |
 | Auth | `POST /api/admin/login`, `POST /api/auth/otp`, `POST /api/auth/verify`, `POST /api/auth/google`, `GET /api/config` |
 
 Admin routes need `Authorization: Bearer <token>` from `/api/admin/login` (12-hour, HMAC-signed).

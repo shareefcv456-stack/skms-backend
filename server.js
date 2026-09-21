@@ -76,6 +76,7 @@ function pgStore(connectionString) {
     getEnrollment: async id => (await q('SELECT data FROM enrollments WHERE id = $1', [id]))[0]?.data,
     putEnrollment: e => q('INSERT INTO enrollments (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2', [e.id, JSON.stringify(e)]),
     listEnrollments: async () => (await q('SELECT data FROM enrollments ORDER BY created_at DESC LIMIT 1000')).map(r => r.data),
+    listUserEnrollments: async email => (await q('SELECT data FROM enrollments WHERE data->>\'email\' = $1 ORDER BY created_at DESC LIMIT 100', [email])).map(r => r.data),
     // web_users, not users: the mobile app backend owns a `users` table with its own columns in this database
     getUser: async email => (await q('SELECT data FROM web_users WHERE email = $1', [email]))[0]?.data,
     putUser: u => q('INSERT INTO web_users (email, data) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET data = $2', [u.email, JSON.stringify(u)]),
@@ -183,6 +184,7 @@ function fileStore(file) {
     getEnrollment: async id => (await load()).enrollments[id],
     putEnrollment: e => write(d => { d.enrollments[e.id] = e; }),
     listEnrollments: async () => Object.values((await load()).enrollments).sort((a, b) => String(b.date).localeCompare(String(a.date))),
+    listUserEnrollments: async email => Object.values((await load()).enrollments).filter(e => e.email === email).sort((a, b) => String(b.date).localeCompare(String(a.date))).slice(0, 100),
     grantAppAccess: async () => null,   // no app tables in the JSON store — the sync is a no-op, and is retried later
     // no plan table in the JSON file (local dev without DATABASE_URL) = no app database: the saved cards stand in
     listAppPlans: async () => { const p = (await load()).appPlans; return p ? structuredClone(p) : null; },
@@ -318,12 +320,18 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);   // Render/Vercel sit behind one proxy; needed for req.ip
 
 /* CORS: only the two front ends may call the API from a browser. CLIENT_URL / ADMIN_URL take a comma-separated
-   list (e.g. the Vercel production domain plus a custom one); outside production the Vite dev servers are allowed
-   too. Auth is a bearer token, never a cookie, so an origin missing from the list just can't read responses. */
+   list (e.g. the Vercel production domain plus a custom one). The Vite dev servers are allowed too — in production
+   as well, so local development can run against the live API. Auth is a bearer token in the Authorization header;
+   no cookies are set, but credentialed requests are allowed for the listed origins (never for any other). */
 const originList = v => String(v || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
-const ORIGINS = new Set([...originList(env.CLIENT_URL), ...originList(env.ADMIN_URL),
-  ...(PROD ? [] : ['http://localhost:5173', 'http://localhost:5174'])]);
-if (PROD && !ORIGINS.size) console.warn('[cors] CLIENT_URL / ADMIN_URL not set — browsers will be refused by every front end');
+const ORIGINS = new Set([
+  ...originList(env.CLIENT_URL),
+  ...originList(env.ADMIN_URL),
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'https://skms-frontend.vercel.app',
+]);
+if (PROD && !env.CLIENT_URL && !env.ADMIN_URL) console.warn('[cors] CLIENT_URL / ADMIN_URL not set — browsers on the deployed front ends will be refused');
 
 // every /api response is JSON
 app.use('/api', (req, res, next) => {
@@ -333,6 +341,7 @@ app.use('/api', (req, res, next) => {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Max-Age': '86400',
   });
   res.type('application/json');
@@ -634,6 +643,33 @@ app.delete('/api/cms/:section', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/enrollments', requireAdmin, async (req, res) => res.json(await db.listEnrollments()));
+
+app.get('/api/account', async (req, res) => {
+  const user = bearer(req, 'user');
+  if (!user) return res.status(401).json({ error: 'Please log in' });
+  const profile = await db.getUser(user.email);
+  const enrollments = await db.listUserEnrollments(user.email);
+  res.json({
+    user: { email: user.email, name: profile?.name, phone: profile?.phone, picture: profile?.picture, role: 'user' },
+    activePlans: enrollments.filter(e => e.status === 'Success').map(e => ({
+      id: e.id, planId: e.planId, plan: e.plan, price: e.price, currency: e.currency, date: e.date, status: e.status, appSync: e.appSync,
+    })),
+  });
+});
+
+app.put('/api/account', async (req, res) => {
+  const session = bearer(req, 'user');
+  if (!session) return res.status(401).json({ error: 'Please log in' });
+  const current = await db.getUser(session.email) || { email: session.email };
+  const name = String(req.body?.name ?? current.name ?? '').trim();
+  const phone = String(req.body?.phone ?? current.phone ?? '').replace(/[\s()-]/g, '');
+  if (!name || name.length > 100 || (phone && !/^\+?\d{7,15}$/.test(phone))) {
+    return res.status(400).json({ error: 'Enter a valid name and phone number' });
+  }
+  const profile = { ...current, email: session.email, name, phone };
+  await db.putUser(profile);
+  res.json({ user: { email: profile.email, name: profile.name, phone: profile.phone, picture: profile.picture, role: 'user' } });
+});
 
 /* payments */
 app.post(['/api/checkout/razorpay', '/api/payments/order'], async (req, res) => {

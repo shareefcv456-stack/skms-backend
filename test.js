@@ -51,6 +51,9 @@ const server = require('./server').listen(0, async () => {
     assert.equal(await cors('https://admin.skms.example'), 'https://admin.skms.example');
     assert.equal(await cors('http://localhost:5173'), 'http://localhost:5173');
     assert.equal(await cors('https://evil.example'), null);
+    const pre = await fetch(base + '/api/admin/login', { method: 'OPTIONS', headers: { Origin: 'https://skms.example' } });
+    assert.equal(pre.headers.get('access-control-allow-credentials'), 'true');
+    assert.match(pre.headers.get('access-control-allow-headers'), /Authorization/);
 
     // auth
     assert.equal((await call('/api/cms/faqs', { body: '[]' }, 'PUT'))[0], 401);
