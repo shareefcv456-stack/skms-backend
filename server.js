@@ -65,7 +65,25 @@ function pgStore(connectionString) {
   const init = () => ready ??= pool.query(`
     CREATE TABLE IF NOT EXISTS cms (key text PRIMARY KEY, value jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
     CREATE TABLE IF NOT EXISTS enrollments (id text PRIMARY KEY, data jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
-    CREATE TABLE IF NOT EXISTS web_users (email text PRIMARY KEY, data jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+    -- one-time upgrade of the old (email PK, data, created_at) table: moved aside, rebuilt in the users-table column order, copied back.
+    -- This whole string is one implicit transaction; the lock makes a second instance starting up at the same moment wait, then skip.
+    SELECT pg_advisory_xact_lock(hashtext('web_users migration'));
+    DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'web_users' AND column_name = 'created_at') THEN
+        ALTER TABLE web_users RENAME CONSTRAINT web_users_pkey TO web_users_old_pkey;
+        ALTER TABLE web_users RENAME TO web_users_old;
+      END IF;
+    END $$;
+    CREATE TABLE IF NOT EXISTS web_users (id serial PRIMARY KEY, email text UNIQUE NOT NULL, name text, phone text, data jsonb,
+      "createdAt" timestamp DEFAULT CURRENT_TIMESTAMP);
+    DO $$ BEGIN
+      IF to_regclass('web_users_old') IS NOT NULL THEN
+        INSERT INTO web_users (email, name, phone, data, "createdAt")
+          SELECT email, nullif(data->>'name', ''), nullif(data->>'phone', ''), data - 'email' - 'name' - 'phone', created_at AT TIME ZONE 'UTC'
+          FROM web_users_old ORDER BY created_at;
+        DROP TABLE web_users_old;
+      END IF;
+    END $$;
     CREATE TABLE IF NOT EXISTS web_reviews (id text PRIMARY KEY, data jsonb NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());`
   ).catch(err => { ready = null; throw err; });
   const q = async (sql, args) => { await init(); return (await pool.query(sql, args)).rows; };
@@ -78,8 +96,14 @@ function pgStore(connectionString) {
     listEnrollments: async () => (await q('SELECT data FROM enrollments ORDER BY created_at DESC LIMIT 1000')).map(r => r.data),
     listUserEnrollments: async email => (await q('SELECT data FROM enrollments WHERE data->>\'email\' = $1 ORDER BY created_at DESC LIMIT 100', [email])).map(r => r.data),
     // web_users, not users: the mobile app backend owns a `users` table with its own columns in this database
-    getUser: async email => (await q('SELECT data FROM web_users WHERE email = $1', [email]))[0]?.data,
-    putUser: u => q('INSERT INTO web_users (email, data) VALUES ($1, $2) ON CONFLICT (email) DO UPDATE SET data = $2', [u.email, JSON.stringify(u)]),
+    // email/name/phone are real columns (same shape as `users`); everything else (picture, googleId, …) rides in data
+    getUser: async email => {
+      const r = (await q('SELECT email, name, phone, data FROM web_users WHERE email = $1', [email]))[0];
+      return r && { ...r.data, email: r.email, name: r.name ?? undefined, phone: r.phone ?? undefined };
+    },
+    putUser: ({ email, name, phone, ...data }) => q(`INSERT INTO web_users (email, name, phone, data) VALUES ($1, $2, $3, $4)
+      ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, phone = EXCLUDED.phone, data = EXCLUDED.data`,
+      [email, name || null, phone || null, JSON.stringify(data)]),
     /* The mobile app's Prisma tables (users, plans, subscriptions) live in this same Neon database,
        so a paid website plan becomes app access with two writes — no call to the app backend.
        Returns the ids, or null when the plan row is gone. */
