@@ -758,4 +758,13 @@ module.exports = app;   // test.js imports the app; `npm start` runs it directly
 if (require.main === module) {
   const port = env.PORT || 4000;
   app.listen(port, () => console.log(`Dr. SKM's Academy API on http://localhost:${port}`));
+  // run the schema setup / web_users migration now rather than on the first request, and say where and how it went.
+  // Not fatal: requests keep being served from the fallback store and the next query retries (a suspended Neon branch
+  // can miss the first attempt), and /api/health reports storage: "fallback" with the error until it succeeds.
+  if (env.DATABASE_URL) {
+    const u = new URL(env.DATABASE_URL), where = `${u.hostname.split('.')[0]}${u.pathname}`;
+    primary.getCms().then(
+      () => console.log(`[db] ${where}: schema ready (web_users: id, email, name, phone, data, createdAt)`),
+      err => console.error(`[db] ${where}: schema setup / web_users migration FAILED — ${err.message}`));
+  }
 }
