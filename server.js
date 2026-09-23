@@ -84,7 +84,15 @@ function pgStore(connectionString) {
         DROP TABLE web_users_old;
       END IF;
     END $$;
-    CREATE TABLE IF NOT EXISTS web_reviews (id text PRIMARY KEY, data jsonb NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());`
+    ALTER TABLE web_users ADD COLUMN IF NOT EXISTS is_subscribed boolean NOT NULL DEFAULT false;
+    CREATE TABLE IF NOT EXISTS web_reviews (id text PRIMARY KEY, data jsonb NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+    -- Razorpay verification details on the app's own (Prisma-owned) subscriptions table. Additive only: IF EXISTS
+    -- skips it on a database without the app tables, IF NOT EXISTS leaves any column the app already defines alone.
+    ALTER TABLE IF EXISTS subscriptions
+      ADD COLUMN IF NOT EXISTS razorpay_payment_id text,
+      ADD COLUMN IF NOT EXISTS razorpay_order_id   text,
+      ADD COLUMN IF NOT EXISTS razorpay_signature  text,
+      ADD COLUMN IF NOT EXISTS status              text NOT NULL DEFAULT 'pending';`
   ).catch(err => { ready = null; throw err; });
   const q = async (sql, args) => { await init(); return (await pool.query(sql, args)).rows; };
   return {
@@ -104,10 +112,12 @@ function pgStore(connectionString) {
     putUser: ({ email, name, phone, ...data }) => q(`INSERT INTO web_users (email, name, phone, data) VALUES ($1, $2, $3, $4)
       ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, phone = EXCLUDED.phone, data = EXCLUDED.data`,
       [email, name || null, phone || null, JSON.stringify(data)]),
+    // paid at least once. The checkout writes the web_users row before the order, so the UPDATE always has a row to hit.
+    markSubscribed: email => q('UPDATE web_users SET is_subscribed = true WHERE email = $1', [email]),
     /* The mobile app's Prisma tables (users, plans, subscriptions) live in this same Neon database,
        so a paid website plan becomes app access with two writes — no call to the app backend.
        Returns the ids, or null when the plan row is gone. */
-    grantAppAccess: async ({ email, name, phone, courseId, planId, days }) => {
+    grantAppAccess: async ({ email, name, phone, courseId, planId, days, paymentId, orderId, signature }) => {
       await init();
       const c = await pool.connect(), one = async (sql, args) => (await c.query(sql, args)).rows;
       try {
@@ -128,10 +138,18 @@ function pgStore(connectionString) {
         const plan = (await one('SELECT "courseId", "durationDays" FROM plans WHERE id = $1', [planId]))[0];
         if (!plan) { await c.query('ROLLBACK'); return null; }
         // WHERE NOT EXISTS makes this idempotent: /verify and the webhook both fire for one payment
-        const sub = await one(`INSERT INTO subscriptions ("userId", "courseId", "planId", "startDate", "endDate", "isActive")
-          SELECT $1, $2, $3, now(), now() + ($4 || ' days')::interval, true
+        const args = [userId, plan.courseId ?? courseId, planId, String(plan.durationDays ?? days), paymentId || null, orderId || null, signature || null];
+        const sub = await one(`INSERT INTO subscriptions ("userId", "courseId", "planId", "startDate", "endDate", "isActive",
+            razorpay_payment_id, razorpay_order_id, razorpay_signature, status)
+          SELECT $1, $2, $3, now(), now() + ($4 || ' days')::interval, true, $5, $6, $7, 'success'
           WHERE NOT EXISTS (SELECT 1 FROM subscriptions WHERE "userId" = $1 AND "planId" = $3 AND "isActive" AND "endDate" > now())
-          RETURNING id`, [userId, plan.courseId ?? courseId, planId, String(plan.durationDays ?? days)]);
+          RETURNING id`, args);
+        // the row was already there (webhook first, then /verify): fill in whatever it still lacks — only /verify
+        // carries razorpay_signature — without ever rewriting details already recorded for that subscription
+        if (!sub[0]) await one(`UPDATE subscriptions SET razorpay_payment_id = coalesce(razorpay_payment_id, $3),
+            razorpay_order_id = coalesce(razorpay_order_id, $4), razorpay_signature = coalesce(razorpay_signature, $5), status = 'success'
+          WHERE "userId" = $1 AND "planId" = $2 AND "isActive" AND "endDate" > now()`,
+          [userId, planId, paymentId || null, orderId || null, signature || null]);
         await c.query('COMMIT');
         return { userId, courseId: plan.courseId ?? courseId, planId, subscriptionId: sub[0]?.id ?? null, at: new Date().toISOString() };
       } catch (err) {
@@ -230,6 +248,7 @@ function fileStore(file) {
     },
     getUser: async email => (await load()).users?.[email],
     putUser: u => write(d => { (d.users ??= {})[u.email] = u; }),
+    markSubscribed: email => write(d => { if (d.users?.[email]) d.users[email].is_subscribed = true; }),
     putReview: r => write(d => { (d.reviews ??= {})[r.id] = r; }),
     delReview: id => write(d => { delete d.reviews?.[id]; }),
     listSubmissions: async () => Object.values((await load()).reviews || {}).sort((a, b) => String(b.date).localeCompare(String(a.date))),
@@ -324,10 +343,15 @@ async function findPlan(programId, index, planRef) {
 /* Paid plan -> access in the mobile app. Runs once per enrollment (the result is kept on it) and never
    fails the request: the money is already taken, so a sync error is logged and left visible to the admin. */
 async function syncAppAccess(enrollment) {
+  // the website's own flag, set on every successful payment (replays included) even when the plan maps to no app course.
+  // Never fails the request, for the same reason as below: the money is already taken.
+  if (enrollment.email) await db.markSubscribed(enrollment.email).catch(err => console.error('[is_subscribed] failed for', enrollment.email, err.message));
   const map = enrollment.app;
   if (!map || enrollment.appSync) return enrollment;
   try {
-    const appSync = await db.grantAppAccess({ ...map, email: enrollment.email, name: enrollment.name, phone: enrollment.phone });
+    // enrollment.id IS the Razorpay order id (the order row is stored under it); signature only exists on the /verify path
+    const appSync = await db.grantAppAccess({ ...map, email: enrollment.email, name: enrollment.name, phone: enrollment.phone,
+      paymentId: enrollment.paymentId, orderId: enrollment.id, signature: enrollment.signature });
     if (appSync) return { ...enrollment, appSync, appSyncError: undefined };
     console.warn('[app-sync] not granted for', enrollment.id, '— no app plan row, or no database');
     return enrollment;
@@ -743,7 +767,7 @@ app.post(['/api/checkout/razorpay/verify', '/api/payments/verify'], async (req, 
   }
   const e = await db.getEnrollment(orderId);
   if (!e) return res.status(404).json({ error: 'Order not found' });
-  const enrollment = await syncAppAccess({ ...e, paymentId, status: 'Success' });
+  const enrollment = await syncAppAccess({ ...e, paymentId, signature, status: 'Success' });
   await db.putEnrollment(enrollment);
   res.json({ enrollment });
 });
