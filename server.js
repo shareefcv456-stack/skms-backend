@@ -135,7 +135,8 @@ function pgStore(connectionString) {
           await one('UPDATE users SET name = coalesce(name, $2), phone = coalesce(phone, $3), "updatedAt" = now() WHERE id = $1', [userId, name || null, phone || null]);
         }
         // the app's own plan row is the authority on length; `days` is the fallback
-        const plan = (await one('SELECT "courseId", "durationDays" FROM plans WHERE id = $1', [planId]))[0];
+        const plan = (await one(`SELECT p."courseId", p."durationDays", p.title AS plan_name, c.title AS course_name
+          FROM plans p LEFT JOIN courses c ON c.id = p."courseId" WHERE p.id = $1`, [planId]))[0];
         if (!plan) { await c.query('ROLLBACK'); return null; }
         // WHERE NOT EXISTS makes this idempotent: /verify and the webhook both fire for one payment
         const args = [userId, plan.courseId ?? courseId, planId, String(plan.durationDays ?? days), paymentId || null, orderId || null, signature || null];
@@ -151,7 +152,9 @@ function pgStore(connectionString) {
           WHERE "userId" = $1 AND "planId" = $2 AND "isActive" AND "endDate" > now()`,
           [userId, planId, paymentId || null, orderId || null, signature || null]);
         await c.query('COMMIT');
-        return { userId, courseId: plan.courseId ?? courseId, planId, subscriptionId: sub[0]?.id ?? null, at: new Date().toISOString() };
+        return { userId, courseId: plan.courseId ?? courseId, planId, subscriptionId: sub[0]?.id ?? null, at: new Date().toISOString(),
+          user_name: found[0] ? (await one('SELECT name FROM users WHERE id = $1', [userId]))[0]?.name ?? null : name || null,
+          course_name: plan.course_name ?? null, plan_name: plan.plan_name ?? null };
       } catch (err) {
         await c.query('ROLLBACK').catch(() => {});
         throw err;
@@ -159,6 +162,11 @@ function pgStore(connectionString) {
         c.release();
       }
     },
+    // subscriptions with names instead of bare ids; userId is the app's `users` row (web_users has no subscriptions)
+    listSubscriptions: () => q(`SELECT s.id, s."userId", u.name AS user_name, u.email AS user_email, s."courseId", c.title AS course_name,
+        s."planId", p.title AS plan_name, s."startDate", s."endDate", s."isActive", s.status, s.razorpay_payment_id, s.razorpay_order_id, s."createdAt"
+      FROM subscriptions s LEFT JOIN users u ON u.id = s."userId" LEFT JOIN courses c ON c.id = s."courseId" LEFT JOIN plans p ON p.id = s."planId"
+      ORDER BY s."createdAt" DESC LIMIT 1000`),
     // the app's plan rows (published courses only); the website picks the ones it sells by id
     listAppPlans: () => q(`SELECT p.id, p."courseId", p.title, p.price, p.currency, p."durationDays", p."durationLabel",
         p.features, p.entitlements, p."isActive", p."displayOrder"
@@ -227,7 +235,8 @@ function fileStore(file) {
     putEnrollment: e => write(d => { d.enrollments[e.id] = e; }),
     listEnrollments: async () => Object.values((await load()).enrollments).sort((a, b) => String(b.date).localeCompare(String(a.date))),
     listUserEnrollments: async email => Object.values((await load()).enrollments).filter(e => e.email === email).sort((a, b) => String(b.date).localeCompare(String(a.date))).slice(0, 100),
-    grantAppAccess: async () => null,   // no app tables in the JSON store — the sync is a no-op, and is retried later
+    grantAppAccess: async () => null,
+    listSubscriptions: async () => [],   // no app tables in the JSON store — the sync is a no-op, and is retried later
     // no plan table in the JSON file (local dev without DATABASE_URL) = no app database: the saved cards stand in
     listAppPlans: async () => { const p = (await load()).appPlans; return p ? structuredClone(p) : null; },
     // same contract as the pg version: everything is computed on a copy and written once, so a failure changes nothing
@@ -691,6 +700,7 @@ app.delete('/api/cms/:section', requireAdmin, async (req, res) => {
 });
 
 app.get('/api/enrollments', requireAdmin, async (req, res) => res.json(await db.listEnrollments()));
+app.get('/api/subscriptions', requireAdmin, async (req, res) => res.json(await db.listSubscriptions()));
 
 app.get('/api/account', async (req, res) => {
   const user = bearer(req, 'user');
