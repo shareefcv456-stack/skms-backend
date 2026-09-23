@@ -92,7 +92,20 @@ function pgStore(connectionString) {
       ADD COLUMN IF NOT EXISTS razorpay_payment_id text,
       ADD COLUMN IF NOT EXISTS razorpay_order_id   text,
       ADD COLUMN IF NOT EXISTS razorpay_signature  text,
-      ADD COLUMN IF NOT EXISTS status              text NOT NULL DEFAULT 'pending';`
+      ADD COLUMN IF NOT EXISTS status              text NOT NULL DEFAULT 'pending',
+      -- readable copies of the linked names, so the Neon table view shows text instead of bare ids
+      ADD COLUMN IF NOT EXISTS user_name           text,
+      ADD COLUMN IF NOT EXISTS course_name         text,
+      ADD COLUMN IF NOT EXISTS plan_name           text;
+    -- fill the names on rows written without them (older rows, or ones the app creates); never overwrites a name
+    DO $$ BEGIN
+      IF to_regclass('subscriptions') IS NOT NULL THEN
+        UPDATE subscriptions s SET user_name = coalesce(s.user_name, u.name), course_name = coalesce(s.course_name, c.title),
+          plan_name = coalesce(s.plan_name, p.title)
+        FROM subscriptions x LEFT JOIN users u ON u.id = x."userId" LEFT JOIN courses c ON c.id = x."courseId" LEFT JOIN plans p ON p.id = x."planId"
+        WHERE x.id = s.id AND (s.user_name IS NULL AND u.name IS NOT NULL OR s.course_name IS NULL AND c.title IS NOT NULL OR s.plan_name IS NULL AND p.title IS NOT NULL);
+      END IF;
+    END $$;`
   ).catch(err => { ready = null; throw err; });
   const q = async (sql, args) => { await init(); return (await pool.query(sql, args)).rows; };
   return {
@@ -139,22 +152,24 @@ function pgStore(connectionString) {
           FROM plans p LEFT JOIN courses c ON c.id = p."courseId" WHERE p.id = $1`, [planId]))[0];
         if (!plan) { await c.query('ROLLBACK'); return null; }
         // WHERE NOT EXISTS makes this idempotent: /verify and the webhook both fire for one payment
-        const args = [userId, plan.courseId ?? courseId, planId, String(plan.durationDays ?? days), paymentId || null, orderId || null, signature || null];
+        const userName = (await one('SELECT name FROM users WHERE id = $1', [userId]))[0]?.name ?? null;
+        const names = [userName, plan.course_name ?? null, plan.plan_name ?? null];
+        const args = [userId, plan.courseId ?? courseId, planId, String(plan.durationDays ?? days), paymentId || null, orderId || null, signature || null, ...names];
         const sub = await one(`INSERT INTO subscriptions ("userId", "courseId", "planId", "startDate", "endDate", "isActive",
-            razorpay_payment_id, razorpay_order_id, razorpay_signature, status)
-          SELECT $1, $2, $3, now(), now() + ($4 || ' days')::interval, true, $5, $6, $7, 'success'
+            razorpay_payment_id, razorpay_order_id, razorpay_signature, status, user_name, course_name, plan_name)
+          SELECT $1, $2, $3, now(), now() + ($4 || ' days')::interval, true, $5, $6, $7, 'success', $8, $9, $10
           WHERE NOT EXISTS (SELECT 1 FROM subscriptions WHERE "userId" = $1 AND "planId" = $3 AND "isActive" AND "endDate" > now())
           RETURNING id`, args);
         // the row was already there (webhook first, then /verify): fill in whatever it still lacks — only /verify
         // carries razorpay_signature — without ever rewriting details already recorded for that subscription
         if (!sub[0]) await one(`UPDATE subscriptions SET razorpay_payment_id = coalesce(razorpay_payment_id, $3),
-            razorpay_order_id = coalesce(razorpay_order_id, $4), razorpay_signature = coalesce(razorpay_signature, $5), status = 'success'
+            razorpay_order_id = coalesce(razorpay_order_id, $4), razorpay_signature = coalesce(razorpay_signature, $5), status = 'success',
+            user_name = coalesce(user_name, $6), course_name = coalesce(course_name, $7), plan_name = coalesce(plan_name, $8)
           WHERE "userId" = $1 AND "planId" = $2 AND "isActive" AND "endDate" > now()`,
-          [userId, planId, paymentId || null, orderId || null, signature || null]);
+          [userId, planId, paymentId || null, orderId || null, signature || null, ...names]);
         await c.query('COMMIT');
         return { userId, courseId: plan.courseId ?? courseId, planId, subscriptionId: sub[0]?.id ?? null, at: new Date().toISOString(),
-          user_name: found[0] ? (await one('SELECT name FROM users WHERE id = $1', [userId]))[0]?.name ?? null : name || null,
-          course_name: plan.course_name ?? null, plan_name: plan.plan_name ?? null };
+          user_name: names[0], course_name: names[1], plan_name: names[2] };
       } catch (err) {
         await c.query('ROLLBACK').catch(() => {});
         throw err;
