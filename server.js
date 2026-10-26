@@ -539,10 +539,14 @@ app.post('/api/auth/verify', async (req, res) => {
   res.json({ ...issueToken(user.email, 'user'), user: { email: user.email, name: user.name, phone: user.phone } });
 });
 
-/* Google sign-in (GIS ID-token flow): the browser gets a signed JWT credential from One Tap / the
-   account picker and posts it here. Google's tokeninfo endpoint checks the RS256 signature, the
-   expiry and the issuer for us, and hands back the profile claims in the same call. */
+/* Google sign-in. Two shapes reach this endpoint:
+   - { accessToken } from the OAuth2 token client (the "Continue with Google" account-chooser popup).
+     tokeninfo confirms it is live and was issued to OUR client id (aud), then userinfo supplies the profile.
+   - { credential }, a signed JWT ID token (GIS One Tap / button). tokeninfo checks the RS256 signature,
+     the expiry and the issuer, and hands back the profile claims in the same call. */
 const GOOGLE_TOKENINFO = 'https://oauth2.googleapis.com/tokeninfo?id_token=';
+const GOOGLE_ACCESS_TOKENINFO = 'https://oauth2.googleapis.com/tokeninfo?access_token=';
+const GOOGLE_USERINFO = 'https://openidconnect.googleapis.com/v1/userinfo';
 const GOOGLE_ISSUERS = ['accounts.google.com', 'https://accounts.google.com'];
 
 app.post('/api/auth/google', async (req, res) => {
@@ -550,16 +554,28 @@ app.post('/api/auth/google', async (req, res) => {
   const key = 'google:' + req.ip;
   if (blocked(key)) return res.status(429).json(TOO_MANY);
 
-  const credential = String(req.body?.credential ?? '');
   const fail = () => { strike(key); res.status(401).json({ error: 'Google sign-in failed — please try again' }); };
-  if (!/^[\w-]+\.[\w-]+\.[\w-]+$/.test(credential)) return fail();   // must look like a JWT
+  const getJson = (url, opts) => fetch(url, { ...opts, signal: AbortSignal.timeout(10000) })
+    .then(r => r.ok ? r.json() : null).catch(() => null);
 
-  const r = await fetch(GOOGLE_TOKENINFO + encodeURIComponent(credential), { signal: AbortSignal.timeout(10000) }).catch(() => null);
-  const p = r?.ok ? await r.json().catch(() => null) : null;
-  // tokeninfo rejects a bad signature or an expired token outright; aud pins the token to THIS site
-  // (without it a JWT minted for any other Google app would log a user in here) and iss pins the signer.
-  if (!p || p.aud !== GOOGLE_CLIENT_ID || !GOOGLE_ISSUERS.includes(p.iss)
-      || String(p.email_verified) !== 'true' || !p.email) return fail();
+  let p;
+  const accessToken = String(req.body?.accessToken ?? '');
+  if (accessToken) {
+    if (!/^[\w.-]{20,4096}$/.test(accessToken)) return fail();
+    // aud pins the token to THIS site — without it an access token granted to any other Google app would log in here
+    const info = await getJson(GOOGLE_ACCESS_TOKENINFO + encodeURIComponent(accessToken));
+    if (!info || info.aud !== GOOGLE_CLIENT_ID) return fail();
+    p = await getJson(GOOGLE_USERINFO, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!p || p.sub !== info.sub) return fail();
+  } else {
+    const credential = String(req.body?.credential ?? '');
+    if (!/^[\w-]+\.[\w-]+\.[\w-]+$/.test(credential)) return fail();   // must look like a JWT
+    p = await getJson(GOOGLE_TOKENINFO + encodeURIComponent(credential));
+    // tokeninfo rejects a bad signature or an expired token outright; aud pins the token to THIS site
+    // (without it a JWT minted for any other Google app would log a user in here) and iss pins the signer.
+    if (!p || p.aud !== GOOGLE_CLIENT_ID || !GOOGLE_ISSUERS.includes(p.iss)) return fail();
+  }
+  if (String(p.email_verified) !== 'true' || !p.email) return fail();
   attempts.delete(key);
 
   // upsert into web_users: INSERT … ON CONFLICT (email) DO UPDATE, so a repeat sign-in refreshes the
