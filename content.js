@@ -28,7 +28,7 @@ const DEFAULTS = {
      plus a fallback copy of the database values for when it can't be reached.
      program: id (plans.html#id), label, courseId (app `courses` row), and home-card promo wording (all optional):
      badge, flag, early (note in the price box), tone — never a price.
-     card: planId, name (shown only on named cards), price (INR), durationDays, duration (access label), features[],
+     card: planId, name (shown only on named cards), price (USD), durationDays, duration (access label), features[],
      was, note, flag, sub, tone (grey|blue|pink), dark */
   plans: [
     { id: 'gp', label: 'GP License Exam', courseId: 22, cards: [

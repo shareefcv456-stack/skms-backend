@@ -31,7 +31,7 @@ const SESSION_SECRET = env.ADMIN_SESSION_SECRET || crypto.createHash('sha256').u
 /* Razorpay — plain REST over fetch, no SDK. Both keys must be present or checkout is simulated. */
 const RZP_KEY_ID = env.RAZORPAY_KEY_ID || '';
 const RZP_KEY_SECRET = env.RAZORPAY_KEY_SECRET || '';
-const RZP_CURRENCY = 'INR';   // every price on the site is in rupees; a plan's number is charged as ₹ (× 100 paise)
+const RZP_CURRENCY = (env.RAZORPAY_CURRENCY || 'USD').toUpperCase();   // every price on the site is in this currency; a plan's number is charged × 100 (cents)
 const RZP_AUTH = 'Basic ' + Buffer.from(`${RZP_KEY_ID}:${RZP_KEY_SECRET}`).toString('base64');
 const MOCK_PAY = !RZP_KEY_ID || !RZP_KEY_SECRET;   // no keys -> simulated checkout (never in production)
 console.log(MOCK_PAY
@@ -204,7 +204,7 @@ function pgStore(connectionString) {
             ids.push(u.id);
           } else {
             const r = await c.query(`INSERT INTO plans ("courseId", title, price, "durationDays", "durationLabel", features, "displayOrder", currency, "updatedAt")
-              VALUES ($7, $1, $2, $3, $4, $5, $6, 'INR', now()) RETURNING id`, [...v, u.courseId]);
+              VALUES ($7, $1, $2, $3, $4, $5, $6, '${RZP_CURRENCY}', now()) RETURNING id`, [...v, u.courseId]);
             ids.push(r.rows[0].id);
           }
         }
@@ -260,7 +260,7 @@ function fileStore(file) {
       let next = Math.max(0, ...plans.map(p => p.id)) + 1;
       const ids = upserts.map(u => {
         const f = { title: u.title, price: u.price, durationDays: u.durationDays, durationLabel: u.durationLabel, features: u.features, displayOrder: u.displayOrder, isActive: true };
-        if (!u.id) return plans.push({ id: next, courseId: u.courseId, currency: 'INR', entitlements: [], ...f }), next++;
+        if (!u.id) return plans.push({ id: next, courseId: u.courseId, currency: RZP_CURRENCY, entitlements: [], ...f }), next++;
         const p = plans.find(x => x.id === u.id && x.courseId === u.courseId);
         if (!p) throw Object.assign(new Error(`Plan #${u.id} is not in course #${u.courseId}`), { status: 409 });
         return Object.assign(p, f).id;

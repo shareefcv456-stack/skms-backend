@@ -199,7 +199,7 @@ const server = require('./server').listen(0, async () => {
     assert.equal(store.appPlans.find(p => p.id === 6).isActive, true, 'app-only plans are never switched off');
     assert.ok(store.cms.plans.find(g => g.id === 'gp').cards.every(c => c.planId), 'the presentation is saved with every plan id');
 
-    // checkout charges the database price, in INR, and refuses a plan the page no longer matches
+    // checkout charges the database price, in USD, and refuses a plan the page no longer matches
     const realFetch = globalThis.fetch;
     let rzpOrder = null;
     globalThis.fetch = (url, opts) => String(url).startsWith('https://api.razorpay.com/') ? (rzpOrder = JSON.parse(opts.body),
@@ -208,7 +208,7 @@ const server = require('./server').listen(0, async () => {
       const buy = body => call('/api/payments/order', { body: json({ planId: 'gp', name: 'A', phone: '9876543210', ...body }), headers: student });
       assert.equal((await buy({ index: 1, planRef: 15 }))[0], 200);
       assert.equal((await call('/api/checkout/razorpay', { body: json({ planId: 'gp', index: 1, planRef: 15, name: 'A' }), headers: student }))[0], 200, 'the checkout alias creates the same order');
-      assert.deepEqual([rzpOrder.amount, rzpOrder.currency], [9500, 'INR'], 'charged ₹95 (the saved database price) in paise, in INR');
+      assert.deepEqual([rzpOrder.amount, rzpOrder.currency], [9500, 'USD'], 'charged $95 (the saved database price) in cents, in USD');
       assert.equal((await buy({ index: 1, planRef: 14 }))[0], 409, 'the page showed a different plan: refuse, never charge the wrong one');
     } finally {
       globalThis.fetch = realFetch;
